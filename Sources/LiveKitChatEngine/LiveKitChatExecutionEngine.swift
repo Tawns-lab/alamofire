@@ -45,18 +45,23 @@ import Foundation
 /// // Register custom commands
 /// engine.registerCommand(MyCustomHandler())
 ///
+/// // Add a remote node (e.g., a phone on the local network)
+/// engine.addRemoteNode(name: "Pixel-7", host: "192.168.1.249", port: 7880)
+/// await engine.connectRemoteNodes()
+///
 /// // Join a room
 /// let session = try await engine.joinRoom("my-room", identity: "user1", name: "Alice")
 ///
 /// // Send messages (commands are detected automatically)
 /// try await engine.send("Hello everyone!", to: "my-room")
-/// try await engine.send("/echo Hello from the engine", to: "my-room")
+/// try await engine.send("/run echo hello from remote node", to: "my-room")
 ///
 /// // Listen for events
 /// for await event in session.events() {
 ///     switch event {
 ///     case .messageReceived(let msg): print("Got: \(msg.content)")
 ///     case .executionResultReceived(let result): print("Result: \(result.output)")
+///     case .remoteNodeEvent(let nodeEvent): print("Node: \(nodeEvent)")
 ///     default: break
 ///     }
 /// }
@@ -74,6 +79,8 @@ public final class LiveKitChatExecutionEngine: @unchecked Sendable {
         case roomLeft(String)
         /// A command was executed with a result.
         case commandExecuted(Command, ExecutionResult)
+        /// A remote node event occurred.
+        case remoteNodeEvent(RemoteNodeManager.Event)
         /// An error occurred.
         case error(any Error)
     }
@@ -93,7 +100,11 @@ public final class LiveKitChatExecutionEngine: @unchecked Sendable {
     /// The message router.
     public let router: MessageRouter
 
+    /// The remote node manager for distributed execution.
+    public let nodeManager: RemoteNodeManager
+
     private var eventContinuation: AsyncStream<Event>.Continuation?
+    private var nodeEventTask: Task<Void, Never>?
     private var isRunning = false
     private let lock = NSLock()
 
@@ -114,6 +125,7 @@ public final class LiveKitChatExecutionEngine: @unchecked Sendable {
 
         self.service = LiveKitService(configuration: configuration, session: session)
         self.router = MessageRouter(configuration: configuration)
+        self.nodeManager = RemoteNodeManager()
         self.executionEngine = ExecutionEngine(
             commandPrefix: commandPrefix,
             defaultTimeout: commandTimeout
@@ -126,6 +138,7 @@ public final class LiveKitChatExecutionEngine: @unchecked Sendable {
         )
 
         setupRouting()
+        registerNodeCommands()
     }
 
     // MARK: - Lifecycle
@@ -141,12 +154,21 @@ public final class LiveKitChatExecutionEngine: @unchecked Sendable {
         self.isRunning = true
         lock.unlock()
 
+        // Forward remote node events
+        let nodeEvents = nodeManager.events()
+        nodeEventTask = Task { [weak self] in
+            for await event in nodeEvents {
+                self?.eventContinuation?.yield(.remoteNodeEvent(event))
+            }
+        }
+
+        nodeManager.startHealthMonitoring()
         continuation.yield(.started)
 
         return stream
     }
 
-    /// Stops the engine, leaving all rooms and cancelling active commands.
+    /// Stops the engine, leaving all rooms, disconnecting nodes, and cancelling active commands.
     public func stop() async {
         lock.lock()
         isRunning = false
@@ -156,6 +178,11 @@ public final class LiveKitChatExecutionEngine: @unchecked Sendable {
         for room in chatEngine.activeRooms() {
             await chatEngine.leaveRoom(room)
         }
+
+        // Disconnect all remote nodes
+        nodeManager.disconnectAll()
+        nodeEventTask?.cancel()
+        nodeEventTask = nil
 
         // Cancel all active commands
         executionEngine.cancelAll()
@@ -302,6 +329,73 @@ public final class LiveKitChatExecutionEngine: @unchecked Sendable {
         try await service.listParticipants(room: roomName)
     }
 
+    // MARK: - Remote Nodes
+
+    /// Registers a remote execution node by its network address.
+    ///
+    /// - Parameters:
+    ///   - name: Human-readable name for the node (e.g., "Pixel-7").
+    ///   - host: The node's IP address or hostname (e.g., "192.168.1.249").
+    ///   - port: The node's port. Defaults to 7880.
+    ///   - capabilities: Node capabilities. Defaults to `[.executeCommands]`.
+    ///   - metadata: Optional metadata (device model, OS, etc.).
+    /// - Returns: The registered `RemoteNode`.
+    @discardableResult
+    public func addRemoteNode(
+        name: String,
+        host: String,
+        port: Int = 7880,
+        capabilities: Set<RemoteNode.Capability> = [.executeCommands],
+        metadata: [String: String] = [:]
+    ) -> RemoteNode {
+        nodeManager.addNode(name: name, host: host, port: port, capabilities: capabilities, metadata: metadata)
+    }
+
+    /// Removes a remote node.
+    public func removeRemoteNode(_ nodeId: String) {
+        nodeManager.removeNode(nodeId)
+    }
+
+    /// Connects to all registered remote nodes.
+    public func connectRemoteNodes() async {
+        await nodeManager.connectAll()
+    }
+
+    /// Connects to a specific remote node by ID.
+    public func connectRemoteNode(_ nodeId: String) async {
+        await nodeManager.connect(nodeId: nodeId)
+    }
+
+    /// Disconnects from all remote nodes.
+    public func disconnectRemoteNodes() {
+        nodeManager.disconnectAll()
+    }
+
+    /// Returns all registered remote nodes.
+    public var remoteNodes: [RemoteNode] {
+        nodeManager.allNodes()
+    }
+
+    /// Returns only connected, available remote nodes.
+    public var availableRemoteNodes: [RemoteNode] {
+        nodeManager.availableNodes()
+    }
+
+    /// Dispatches a command directly to a remote node, bypassing chat.
+    ///
+    /// - Parameters:
+    ///   - command: The command to execute.
+    ///   - strategy: Node selection strategy. Defaults to `.firstAvailable`.
+    ///   - timeout: Execution timeout. Defaults to 30 seconds.
+    /// - Returns: The execution result from the remote node.
+    public func dispatchToRemoteNode(
+        _ command: Command,
+        strategy: RemoteNodeManager.DispatchStrategy = .firstAvailable,
+        timeout: TimeInterval = 30
+    ) async throws -> ExecutionResult {
+        try await nodeManager.dispatch(command, strategy: strategy, timeout: timeout)
+    }
+
     // MARK: - State
 
     /// Whether the engine is currently running.
@@ -322,6 +416,27 @@ public final class LiveKitChatExecutionEngine: @unchecked Sendable {
     }
 
     // MARK: - Private
+
+    private func registerNodeCommands() {
+        // Register /nodes command for managing remote nodes via chat
+        executionEngine.register(NodesCommandHandler(nodeManager: nodeManager))
+
+        // Register /run command to dispatch to remote nodes
+        executionEngine.register(RemoteExecutionHandler(
+            commandName: "run",
+            description: "Execute a command on a remote node",
+            usage: "/run <command> [args...] [--timeout N]",
+            nodeManager: nodeManager
+        ))
+
+        // Register /remote command as an alias
+        executionEngine.register(RemoteExecutionHandler(
+            commandName: "remote",
+            description: "Execute on a specific remote node",
+            usage: "/remote <command> [args...] [--node <id>]",
+            nodeManager: nodeManager
+        ))
+    }
 
     private func setupRouting() {
         // Route incoming chat messages that are commands to the execution engine
